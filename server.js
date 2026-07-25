@@ -78,6 +78,37 @@ function send(res, status, body, headers = {}) {
   res.end(body)
 }
 
+/**
+ * Interprete un en-tete `Range` simple : `bytes=<debut>-<fin>`.
+ *
+ * Volontairement limite a une seule plage. Les plages multiples sont permises
+ * par la norme mais aucun client de mise a jour ne les emploie, et les
+ * accepter a moitie serait pire que les refuser franchement.
+ */
+function parseRange(header, size) {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(String(header || '').trim())
+  if (!match) return null
+
+  const [, rawStart, rawEnd] = match
+  let start
+  let end
+  if (rawStart === '') {
+    // `bytes=-500` : les 500 derniers octets.
+    if (rawEnd === '') return null
+    const length = Number(rawEnd)
+    if (!Number.isFinite(length) || length <= 0) return null
+    start = Math.max(0, size - length)
+    end = size - 1
+  } else {
+    start = Number(rawStart)
+    end = rawEnd === '' ? size - 1 : Number(rawEnd)
+  }
+
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null
+  if (start > end || start < 0 || start >= size) return null
+  return { start, end: Math.min(end, size - 1) }
+}
+
 async function handleDownload(req, res, name) {
   const file = path.join(DATA_DIR, name)
   let stat
@@ -89,17 +120,41 @@ async function handleDownload(req, res, name) {
 
   const headers = {
     'content-type': ALLOWED.get(path.extname(name).toLowerCase()),
-    'content-length': String(stat.size),
     // Le fichier d'index change a chaque publication ; les installeurs, jamais.
-    'cache-control': name.endsWith('.yml') ? 'no-cache' : 'public, max-age=86400'
+    'cache-control': name.endsWith('.yml') ? 'no-cache' : 'public, max-age=86400',
+    // Sans cette annonce, un client ne tenterait meme pas de reprise.
+    'accept-ranges': 'bytes'
   }
 
-  if (req.method === 'HEAD') {
-    res.writeHead(200, headers)
+  /**
+   * Requete partielle.
+   *
+   * electron-updater ne retelecharge pas cent megaoctets quand il possede deja
+   * une version voisine : il compare les empreintes de blocs et ne demande que
+   * les portions modifiees. Repondre le fichier entier a une telle demande lui
+   * fait recoller des morceaux incoherents, et la verification d'integrite
+   * echoue — sans que rien n'indique d'ou vient le probleme.
+   */
+  const range = req.headers.range ? parseRange(req.headers.range, stat.size) : null
+
+  if (req.headers.range && !range) {
+    res.writeHead(416, { 'content-range': `bytes */${stat.size}` })
     return res.end()
   }
 
-  res.writeHead(200, headers)
+  if (range) {
+    const length = range.end - range.start + 1
+    res.writeHead(206, {
+      ...headers,
+      'content-length': String(length),
+      'content-range': `bytes ${range.start}-${range.end}/${stat.size}`
+    })
+    if (req.method === 'HEAD') return res.end()
+    return void fs.createReadStream(file, { start: range.start, end: range.end }).pipe(res)
+  }
+
+  res.writeHead(200, { ...headers, 'content-length': String(stat.size) })
+  if (req.method === 'HEAD') return res.end()
   fs.createReadStream(file).pipe(res)
 }
 

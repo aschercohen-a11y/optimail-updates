@@ -1,4 +1,4 @@
-FROM node:22-alpine
+FROM node:22.23.4-alpine
 
 # Le service tourne sans privileges : l'image node fournit deja un utilisateur
 # `node` non root, autant s'en servir.
